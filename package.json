@@ -1,0 +1,41 @@
+{
+  "name": "github-review-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub PR code-review bot built on the Chat SDK (@chat-adapter/github) + Claude.",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@chat-adapter/github": "^4.29.0",
+    "@chat-adapter/state-memory": "^4.29.0",
+    "@chat-adapter/state-redis": "^4.29.0",
+    "@hono/node-server": "^2.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@octokit/auth-app": "^8.2.0",
+    "@octokit/rest": "^22.0.1",
+    "ai": "^6.0.0",
+    "chat": "^4.29.0",
+    "dotenv": "^17.0.0",
+    "hono": "^4.12.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
