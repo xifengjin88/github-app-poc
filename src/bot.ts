@@ -1,30 +1,11 @@
 import { createGitHubAdapter, type GitHubRawMessage } from "@chat-adapter/github";
-import { createMemoryState } from "@chat-adapter/state-memory";
-import { createRedisState } from "@chat-adapter/state-redis";
-import { Chat, type StateAdapter, type Thread } from "chat";
+import { Chat, type Message, type Thread } from "chat";
 import { githubPrivateKey, requireEnv } from "./env.js";
 import type { PullRequestRef } from "./review.js";
 import { runCostReview } from "./runner.js";
+import { getState } from "./store.js";
 
 const botUserName = process.env.GITHUB_BOT_USERNAME ?? "review-bot";
-
-/**
- * Multi-tenant state.
- *
- * Multi-tenant mode persists a repo -> installation mapping in state so the bot
- * can resolve the right installation across restarts and for proactive sends.
- * Use Redis in production; fall back to in-memory for local dev (mapping is lost
- * on restart, which is fine since each webhook payload carries its installation).
- */
-function createState(): StateAdapter {
-  const url = process.env.REDIS_URL;
-  if (url) return createRedisState({ url });
-  console.warn(
-    "[bot] REDIS_URL not set — using in-memory state. Fine for local dev; " +
-      "set REDIS_URL before deploying a public multi-tenant app.",
-  );
-  return createMemoryState();
-}
 
 /**
  * GitHub adapter in multi-tenant GitHub App mode.
@@ -44,7 +25,7 @@ export const github = createGitHubAdapter({
 export const bot = new Chat({
   userName: botUserName,
   adapters: { github },
-  state: createState(),
+  state: getState(),
 });
 
 function refFromMessage(raw: GitHubRawMessage): PullRequestRef {
@@ -55,8 +36,9 @@ function refFromMessage(raw: GitHubRawMessage): PullRequestRef {
   };
 }
 
-/** Acknowledge the mention, run the cost review, and post it as a bundled review. */
-async function runReview(thread: Thread, raw: GitHubRawMessage): Promise<void> {
+/** Run the cost review for an @mention, using this thread's installation for Archera. */
+async function runReview(thread: Thread, message: Message): Promise<void> {
+  const raw = message.raw as GitHubRawMessage;
   // The GitHub adapter treats issues and PRs the same way; only review PRs.
   if (raw.type === "issue_comment" && raw.threadType === "issue") {
     await thread.post("I only review pull requests — mention me in a PR comment.");
@@ -64,12 +46,12 @@ async function runReview(thread: Thread, raw: GitHubRawMessage): Promise<void> {
   }
 
   const ref = refFromMessage(raw);
-  await thread.post(`👀 Reviewing PR #${ref.prNumber} for cloud-cost impact…`);
+  const installationId = await github.getInstallationId(message.threadId).catch(() => undefined);
 
   try {
-    // Post the formal review (inline comments + summary) via Octokit directly;
-    // the adapter's thread.post can't create line-anchored review comments.
-    const outcome = await runCostReview(github.octokit, ref);
+    // runCostReview posts its own in-progress status comment + the formal review
+    // (inline comments) via Octokit; the adapter's thread.post can't anchor lines.
+    const outcome = await runCostReview(github.octokit, ref, installationId ?? undefined);
     if (outcome === "no-infra") {
       await thread.post(
         "No infrastructure changes (e.g. Terraform) in this PR — nothing to cost-review.",
@@ -86,11 +68,11 @@ async function runReview(thread: Thread, raw: GitHubRawMessage): Promise<void> {
 // First @mention in an unsubscribed PR thread → subscribe + review.
 bot.onNewMention(async (thread, message) => {
   await thread.subscribe();
-  await runReview(thread, message.raw as GitHubRawMessage);
+  await runReview(thread, message);
 });
 
 // Once subscribed, every comment lands here. Only re-review on an explicit re-mention.
 bot.onSubscribedMessage(async (thread, message) => {
   if (!message.isMention) return;
-  await runReview(thread, message.raw as GitHubRawMessage);
+  await runReview(thread, message);
 });

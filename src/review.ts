@@ -5,6 +5,7 @@ import { z } from "zod";
 import { connectArchera } from "./archera.js";
 import { annotateDiff, truncateDiff } from "./diff.js";
 import { filterDiffToInfra } from "./infra.js";
+import { reviewDebugEnabled, trunc, writeReviewLog } from "./log.js";
 
 /** A GitHub pull request to review. */
 export interface PullRequestRef {
@@ -143,45 +144,32 @@ async function structureReview(
   annotatedDiff: string,
   ref: PullRequestRef,
   groundingNotes: string | null,
-): Promise<CostReview> {
+): Promise<{ review: CostReview; usage: unknown }> {
   const notes = groundingNotes
     ? `\n\nUse these REAL Archera pricing/savings findings (prefer them over your own price estimates):\n${groundingNotes}`
     : "";
-  const { object } = await generateObject({
+  const { object, usage } = await generateObject({
     model: anthropic(model),
     schema: CostReviewSchema,
     maxOutputTokens: 4000,
     system: SYSTEM_PROMPT,
     prompt: `${buildReviewPrompt(annotatedDiff, ref)}${notes}`,
   });
-  return object;
+  return { review: object, usage };
 }
 
 /** Outcome of a review attempt. `no-infra` means the PR changed no infra files. */
 export type ReviewStatus = "reviewed" | "no-infra" | "empty";
 
-export interface ReviewResult {
-  status: ReviewStatus;
-  review: CostReview;
-  /** The infra-only diff the poster uses to anchor inline comments. */
-  diff: string;
-  grounded: boolean;
-  /** Infra files that were reviewed. */
-  files: string[];
-}
-
 /**
- * Fetch a PR's diff, keep only the infrastructure files, and produce a
- * structured cloud-cost review with Claude. When Archera is configured, the
- * model first looks up real prices/savings via Archera's MCP tools, then those
- * numbers are folded into the structured review.
- *
- * Returns a status so callers can skip posting when there's nothing to review.
+ * Fast pre-step: fetch the PR diff and keep only the infrastructure files.
+ * No LLM call — used to decide whether to post a status comment and review at all.
+ * Returns the truncated infra-only diff (the poster uses it to anchor comments).
  */
-export async function generateCostReview(
+export async function collectInfraDiff(
   octokit: Octokit,
   ref: PullRequestRef,
-): Promise<ReviewResult> {
+): Promise<{ status: ReviewStatus; diff: string; files: string[] }> {
   const { data } = await octokit.rest.pulls.get({
     owner: ref.owner,
     repo: ref.repo,
@@ -192,39 +180,55 @@ export async function generateCostReview(
   // With `format: "diff"` GitHub returns the raw diff as a string in `data`,
   // even though the static type still says it's the PR object.
   const raw = (data as unknown as string) ?? "";
-  if (!raw.trim()) {
-    return {
-      status: "empty",
-      review: emptyReview("No changes found in this PR."),
-      diff: "",
-      grounded: false,
-      files: [],
-    };
-  }
+  if (!raw.trim()) return { status: "empty", diff: "", files: [] };
 
   // Only review infrastructure changes (Terraform today; extensible in infra.ts).
   const { diff: infraDiff, files } = filterDiffToInfra(raw);
-  if (files.length === 0) {
-    return {
-      status: "no-infra",
-      review: emptyReview("No infrastructure changes to cost-review."),
-      diff: "",
-      grounded: false,
-      files: [],
-    };
-  }
+  if (files.length === 0) return { status: "no-infra", diff: "", files: [] };
 
-  const diff = truncateDiff(infraDiff, MAX_DIFF_CHARS);
+  return { status: "reviewed", diff: truncateDiff(infraDiff, MAX_DIFF_CHARS), files };
+}
+
+/**
+ * Slow step: run the cost analysis over an infra-only diff. When Archera is
+ * configured, the model first looks up real prices/savings via Archera's MCP
+ * tools, then those numbers are folded into the structured review.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: AI SDK tool-call shapes vary by version.
+function summarizeToolActivity(result: any): unknown[] {
+  const calls = result.toolCalls ?? [];
+  const results = result.toolResults ?? [];
+  // biome-ignore lint/suspicious/noExplicitAny: see above.
+  return calls.map((call: any, i: number) => ({
+    tool: call.toolName,
+    input: call.input ?? call.args,
+    output: trunc(JSON.stringify(results[i]?.output ?? results[i]?.result ?? null)),
+  }));
+}
+
+export async function analyzeInfraDiff(
+  diff: string,
+  ref: PullRequestRef,
+  installationId?: number,
+): Promise<{ review: CostReview; grounded: boolean }> {
   const annotated = annotateDiff(diff);
   const model = process.env.REVIEW_MODEL ?? DEFAULT_MODEL;
+  const debug = reviewDebugEnabled();
+  // biome-ignore lint/suspicious/noExplicitAny: free-form debug trace object.
+  const trace: Record<string, any> = {
+    pr: `${ref.owner}/${ref.repo}#${ref.prNumber}`,
+    model,
+    diff,
+  };
 
   // Best-effort: if Archera can't connect, degrade to an ungrounded estimate.
-  const archera = await connectArchera().catch((error) => {
+  const archera = await connectArchera({ installationId }).catch((error) => {
     console.error("[archera] connection failed; producing an ungrounded review", error);
     return null;
   });
 
   try {
+    let groundingNotes: string | null = null;
     if (archera) {
       const grounding = await generateText({
         model: anthropic(model),
@@ -234,12 +238,34 @@ export async function generateCostReview(
         system: GROUNDING_SYSTEM,
         prompt: `${buildReviewPrompt(annotated, ref)}\n\nLook up real prices/savings for the cost-affecting resources in this diff, then summarize the concrete numbers you found.`,
       });
-      const review = await structureReview(model, annotated, ref, grounding.text);
-      return { status: "reviewed", review, diff, grounded: true, files };
+      groundingNotes = grounding.text;
+      if (debug) {
+        trace.grounding = {
+          system: GROUNDING_SYSTEM,
+          notes: grounding.text,
+          steps: grounding.steps?.length ?? 0,
+          toolActivity: summarizeToolActivity(grounding),
+          usage: grounding.usage,
+        };
+      }
     }
 
-    const review = await structureReview(model, annotated, ref, null);
-    return { status: "reviewed", review, diff, grounded: false, files };
+    const { review, usage } = await structureReview(model, annotated, ref, groundingNotes);
+    const grounded = Boolean(archera);
+
+    if (debug) {
+      trace.grounded = grounded;
+      trace.structurePrompt = buildReviewPrompt(annotated, ref);
+      trace.structureUsage = usage;
+      trace.review = review;
+      writeReviewLog(`${ref.owner}-${ref.repo}-pr${ref.prNumber}-${Date.now()}`, trace);
+      console.log(
+        `[review-debug] ${ref.owner}/${ref.repo}#${ref.prNumber}: verdict=${review.verdict} ` +
+          `confidence=${review.confidence}/5 findings=${review.findings.length} grounded=${grounded}`,
+      );
+    }
+
+    return { review, grounded };
   } finally {
     await archera?.close().catch(() => {});
   }

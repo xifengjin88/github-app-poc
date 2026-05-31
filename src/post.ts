@@ -32,11 +32,42 @@ export function splitFindings(
   return { anchored, unanchored };
 }
 
+/** Post an in-progress status comment on the PR; returns its comment id to edit later. */
+export async function postStatusComment(
+  octokit: Octokit,
+  ref: PullRequestRef,
+  body: string,
+): Promise<number> {
+  const { data } = await octokit.rest.issues.createComment({
+    owner: ref.owner,
+    repo: ref.repo,
+    issue_number: ref.prNumber,
+    body,
+  });
+  return data.id;
+}
+
+/** Edit a previously-posted comment in place (e.g. status → final summary). */
+export async function updateComment(
+  octokit: Octokit,
+  ref: PullRequestRef,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  await octokit.rest.issues.updateComment({
+    owner: ref.owner,
+    repo: ref.repo,
+    comment_id: commentId,
+    body,
+  });
+}
+
 /**
- * Post the cost review to the PR as a single bundled GitHub review: a summary
- * body plus inline comments anchored to the relevant lines. Findings whose line
- * can't be matched to the diff are folded into the summary. Falls back to a plain
- * PR comment if the review API rejects the request.
+ * Post the cost review. The summary report goes into `statusCommentId` (edited
+ * in place from the in-progress placeholder, CodeRabbit-style); the inline
+ * findings are posted as a bundled GitHub review. When no status comment is
+ * given, the summary is posted as the review body instead. Findings whose line
+ * can't be matched to the diff are folded into the summary so nothing is lost.
  */
 export async function postCostReview(
   octokit: Octokit,
@@ -44,18 +75,38 @@ export async function postCostReview(
   review: CostReview,
   diff: string,
   grounded: boolean,
+  statusCommentId?: number,
 ): Promise<void> {
   const commentable = parseCommentableLines(diff);
   const { anchored, unanchored } = splitFindings(review.findings, commentable);
-  const body = renderSummaryBody(review, ref, unanchored, grounded);
+  const summary = renderSummaryBody(review, ref, unanchored, grounded);
 
+  if (statusCommentId !== undefined) {
+    // Replace the "in progress" placeholder with the summary report.
+    await updateComment(octokit, ref, statusCommentId, summary);
+    if (anchored.length > 0) {
+      await octokit.rest.pulls
+        .createReview({
+          owner: ref.owner,
+          repo: ref.repo,
+          pull_number: ref.prNumber,
+          event: "COMMENT",
+          body: "🤖 Cloud-cost review — see the summary comment above.",
+          comments: anchored,
+        })
+        .catch((error) => console.error("[postCostReview] inline review failed", error));
+    }
+    return;
+  }
+
+  // No status comment: put the summary in the review body.
   try {
     await octokit.rest.pulls.createReview({
       owner: ref.owner,
       repo: ref.repo,
       pull_number: ref.prNumber,
       event: "COMMENT",
-      body,
+      body: summary,
       comments: anchored,
     });
   } catch (error) {
@@ -64,7 +115,7 @@ export async function postCostReview(
       owner: ref.owner,
       repo: ref.repo,
       issue_number: ref.prNumber,
-      body,
+      body: summary,
     });
   }
 }

@@ -26,6 +26,8 @@ per-file cost notes, optional Mermaid diagram). Diff-only — no repo clone, no 
   `ready_for_review`), plus on-demand via `@mention`.
 - **Real-price grounding via Archera** (optional): when connected, findings cite actual on-demand
   prices and reservation savings instead of model estimates.
+- **In-progress status comment**: posts a `⏳ Reviewing…` placeholder immediately, then edits it in
+  place into the final summary when done (CodeRabbit-style), so the PR shows activity right away.
 
 ## Stack
 
@@ -47,7 +49,9 @@ src/
   runner.ts       # Shared pipeline: generate review -> post review
   review.ts       # Diff fetch + structured cost review (Zod schema + Claude)
   infra.ts        # Which files are "infra" (Terraform today) + filter diff to them
-  archera.ts      # Optional: Archera MCP client → cost-grounding tools for the model
+  archera.ts      # Archera MCP client → cost-grounding tools for the model
+  archera-oauth.ts# Per-installation Archera OAuth + DCR; token storage/refresh
+  store.ts        # Shared state instance (Redis/memory) for bot + tokens
   diff.ts         # Split by file, parse commentable lines, annotate with line numbers
   render.ts       # Markdown for the summary report and inline findings
   post.ts         # Post the bundled GitHub review (inline + summary), with fallback
@@ -137,6 +141,21 @@ npm run lint:fix    # biome check --write
 npm test            # vitest run
 ```
 
+## Debugging — see how a review was produced
+
+Set `REVIEW_DEBUG=1` (in `.env` or inline) to trace each review. For every reviewed PR the bot:
+- prints a one-line summary to the console (`verdict`, `confidence`, `findings`, `grounded`), and
+- writes a full JSON trace to `logs/<owner>-<repo>-pr<N>-<timestamp>.json` containing the exact
+  infra diff sent to the model, the Archera tool calls + (truncated) results during grounding, token
+  usage for both passes, and the final structured review object.
+
+```bash
+REVIEW_DEBUG=1 npm run dev
+# then trigger a review → inspect logs/*.json
+```
+
+`logs/` is gitignored. Override the directory with `REVIEW_LOG_DIR`.
+
 ## Notes & next steps
 
 - **Auto-review path**: the Chat SDK GitHub adapter handles comment events but ignores `pull_request`
@@ -150,16 +169,20 @@ npm test            # vitest run
   thread subscriptions, and distributed locks across restarts and multiple instances. Without it the
   in-memory fallback works (each webhook payload still carries its own installation), but loses that
   state on restart.
-- **Cost grounding via Archera (optional, Phase 1)**: set `ARCHERA_MCP_TOKEN` and the review model
-  looks up REAL on-demand prices and reservation savings through Archera's MCP server
-  (`https://mcp.archera.ai/mcp`) before judging impact — the summary footer then reads
-  "prices grounded in Archera". Without a token it degrades to the model's own estimates (and the
-  footer says so). The token is an Archera OAuth bearer; its default org scopes the data.
-  See `src/archera.ts`.
-  - **Phase 2 (product onboarding, not built):** replace the single env token with a per-installation
-    OAuth connection — GitHub **Setup URL** after install kicks off Archera OAuth (PKCE), the
-    `{token, org_id}` is stored per installation (Redis), and the bot connects to Archera as that
-    tenant at review time. If an install isn't connected, the bot nudges with a connect link.
+- **Cost grounding via Archera**: when an installation is connected, the review model looks up REAL
+  on-demand prices and reservation savings through Archera's MCP server (`https://mcp.archera.ai/mcp`)
+  before judging impact — the summary footer then reads "prices grounded in Archera". Otherwise it
+  degrades to the model's own estimates (and the footer says so). See `src/archera.ts`.
+  - **Per-installation OAuth + DCR (`src/archera-oauth.ts`):** each company connects its own Archera
+    org at install time. GitHub's **Setup URL** (`<PUBLIC_URL>/connect/archera`) sends the admin to
+    `startConnect()` → Archera OAuth (Authorization Code + PKCE; the OAuth client is registered via
+    **Dynamic Client Registration**) → `/oauth/archera/callback` → `finishConnect()` stores the
+    `{access, refresh}` tokens keyed by GitHub installation id (in the shared state, so Redis in
+    production). At review time `getAccessToken(installationId)` returns a fresh bearer (auto-refresh)
+    to connect to MCP as that tenant.
+  - **Single-token fallback:** set `ARCHERA_MCP_TOKEN` to use one bearer for all reviews (handy for
+    local testing without the OAuth dance).
+  - Requires `PUBLIC_URL` (your externally-reachable base, e.g. the tunnel URL) for the OAuth redirect.
 - **Diff-only context** is intentionally simple. To let the model read surrounding code, switch to the
   agentic + Vercel Sandbox approach from Vercel's
   [code-review bot guide](https://vercel.com/kb/guide/ship-a-github-code-review-bot-with-hono-and-redis).

@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { jsonSchema, type ToolSet, tool } from "ai";
+import { getAccessToken } from "./archera-oauth.js";
 
 /**
  * Archera integration (Phase 1): connect the review model to Archera's MCP
@@ -40,11 +41,17 @@ export function archeraConfigured(): boolean {
 
 /**
  * Connect to the Archera MCP server and expose the curated tools as AI SDK
- * tools. Returns null when not configured. Throws if a configured connection
+ * tools. Uses the installation's OAuth token when an installationId is given,
+ * falling back to a single ARCHERA_MCP_TOKEN env var (handy for local testing).
+ * Returns null when no token is available. Throws if a configured connection
  * fails — callers decide whether to degrade gracefully.
  */
-export async function connectArchera(): Promise<ArcheraConnection | null> {
-  const token = process.env.ARCHERA_MCP_TOKEN;
+export async function connectArchera(opts?: {
+  installationId?: number;
+}): Promise<ArcheraConnection | null> {
+  let token: string | null = null;
+  if (opts?.installationId !== undefined) token = await getAccessToken(opts.installationId);
+  if (!token) token = process.env.ARCHERA_MCP_TOKEN ?? null;
   if (!token) return null;
 
   const url = process.env.ARCHERA_MCP_URL ?? DEFAULT_MCP_URL;

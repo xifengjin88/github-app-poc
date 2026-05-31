@@ -4,4 +4,5 @@ node_modules/
 *.pem
 dist/
 *.log
+logs/
 .DS_Store
